@@ -4,6 +4,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/admpub/ip2country"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -11,6 +12,7 @@ func TestSingleIP(t *testing.T) {
 	f, err := New(Options{
 		AllowedIPs:     []string{"222.25.118.1"},
 		BlockByDefault: true,
+		IPDB:           ip2country.Bytes(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -25,6 +27,7 @@ func TestSubnetIP(t *testing.T) {
 	f, err := New(Options{
 		AllowedIPs:     []string{"10.0.0.0/16"},
 		BlockByDefault: true,
+		IPDB:           ip2country.Bytes(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -35,18 +38,23 @@ func TestSubnetIP(t *testing.T) {
 }
 
 func TestManualCountryCode(t *testing.T) {
-	f, err := New(Options{})
+	f, err := New(Options{
+		IPDB: ip2country.Bytes(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	assert.Equal(t, f.IPToCountry("203.25.111.68"), "AU")
 	assert.Equal(t, f.IPToCountry("216.58.199.67"), "US")
+	assert.Equal(t, f.IPToCountry("116.31.116.51"), "CN")
+	assert.Equal(t, f.IPToCountry("117.175.117.164"), "CN")
 }
 
 func TestCountryCodeWhiteList(t *testing.T) {
 	f, err := New(Options{
 		AllowedCountries: []string{"AU"},
 		BlockByDefault:   true,
+		IPDB:             ip2country.Bytes(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +66,7 @@ func TestCountryCodeWhiteList(t *testing.T) {
 func TestCountryCodeBlackList(t *testing.T) {
 	f, err := New(Options{
 		BlockedCountries: []string{"RU", "CN"},
+		IPDB:             ip2country.Bytes(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +77,9 @@ func TestCountryCodeBlackList(t *testing.T) {
 }
 
 func TestDynamicList(t *testing.T) {
-	f, err := New(Options{})
+	f, err := New(Options{
+		IPDB: ip2country.Bytes(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
