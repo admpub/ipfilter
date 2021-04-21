@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/admpub/realip"
 	"github.com/phuslu/iploc"
-	"github.com/tomasen/realip"
 )
 
 //Options for IPFilter. Allow supercedes Block for IP checks
@@ -265,16 +265,6 @@ func (m *ipFilterMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	//success!
 	m.next.ServeHTTP(w, r)
-}
-
-//NewNoDB is the same as New
-func NewNoDB(opts Options) *IPFilter {
-	return New(opts)
-}
-
-//NewLazy is the same as New
-func NewLazy(opts Options) *IPFilter {
-	return New(opts)
 }
 
 func (f *IPFilter) IPToCountry(ipstr string) string {
