@@ -4,7 +4,6 @@ import (
 	"net"
 	"testing"
 
-	"github.com/admpub/ip2country"
 	"github.com/admpub/ipfilter"
 	"github.com/stretchr/testify/assert"
 )
@@ -13,7 +12,6 @@ func TestSingleIP(t *testing.T) {
 	f := ipfilter.New(ipfilter.Options{
 		AllowedIPs:     []string{"222.25.118.1"},
 		BlockByDefault: true,
-		IPDB:           ip2country.Bytes(),
 	})
 	assert.True(t, f.Allowed("222.25.118.1"), "[1] should be allowed")
 	assert.True(t, f.Blocked("222.25.118.2"), "[2] should be blocked")
@@ -25,7 +23,6 @@ func TestSubnetIP(t *testing.T) {
 	f := ipfilter.New(ipfilter.Options{
 		AllowedIPs:     []string{"10.0.0.0/16"},
 		BlockByDefault: true,
-		IPDB:           ip2country.Bytes(),
 	})
 	assert.True(t, f.Allowed("10.0.0.1"), "[1] should be allowed")
 	assert.True(t, f.Allowed("10.0.42.1"), "[2] should be allowed")
@@ -43,7 +40,6 @@ func TestCountryCodeWhiteList(t *testing.T) {
 	f := ipfilter.New(ipfilter.Options{
 		AllowedCountries: []string{"AU"},
 		BlockByDefault:   true,
-		IPDB:             ip2country.Bytes(),
 	})
 	assert.True(t, f.Allowed("203.25.111.68"), "[1] should be allowed")
 	assert.True(t, f.Blocked("216.58.199.67"), "[2] should be blocked")
@@ -52,7 +48,6 @@ func TestCountryCodeWhiteList(t *testing.T) {
 func TestCountryCodeBlackList(t *testing.T) {
 	f := ipfilter.New(ipfilter.Options{
 		BlockedCountries: []string{"RU", "CN"},
-		IPDB:             ip2country.Bytes(),
 	})
 	assert.True(t, f.Allowed("203.25.111.68"), "[1] AU should be allowed")
 	assert.True(t, f.Allowed("216.58.199.67"), "[2] US should be allowed")
