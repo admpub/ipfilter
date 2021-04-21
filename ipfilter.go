@@ -37,11 +37,6 @@ type Options struct {
 	Logger interface {
 		Printf(format string, v ...interface{})
 	}
-	// These fields currently have no effect
-	IPDB         []byte
-	IPDBPath     string
-	IPDBNoFetch  bool
-	IPDBFetchURL string
 }
 
 type IPFilter struct {
