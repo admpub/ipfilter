@@ -1,33 +1,25 @@
 package ipfilter
 
 import (
-	"bytes"
-	"compress/gzip"
-	"errors"
-	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 
-	maxminddb "github.com/oschwald/maxminddb-golang"
+	"github.com/phuslu/iploc"
+	"github.com/tomasen/realip"
 )
 
-var (
-	DBPublicURL = "http://geolite.maxmind.com/download/geoip/database/GeoLite2-Country.mmdb.gz"
-	DBTempPath  = filepath.Join(os.TempDir(), "ipfilter-GeoLite2-Country.mmdb.gz")
-)
-
-//Options for IPFilter. Allowed takes precendence over Blocked.
+//Options for IPFilter. Allow supercedes Block for IP checks
+//across all matching subnets, whereas country checks use the
+//latest Allow/Block setting.
 //IPs can be IPv4 or IPv6 and can optionally contain subnet
-//masks (/24). Note however, determining if a given IP is
+//masks (e.g. /24). Note however, determining if a given IP is
 //included in a subnet requires a linear scan so is less performant
 //than looking up single IPs.
 //
-//This could be improved with some algorithmic magic.
+//This could be improved with cidr range prefix tree.
 type Options struct {
 	//explicity allowed IPs
 	AllowedIPs []string
@@ -37,26 +29,19 @@ type Options struct {
 	AllowedCountries []string
 	//explicity blocked country ISO codes
 	BlockedCountries []string
-	//in-memory GeoLite2-Country.mmdb file,
-	//if not provided falls back to IPDBPath
-	IPDB []byte
-	//path to GeoLite2-Country.mmdb[.gz] file,
-	//if not provided defaults to ipfilter.DBTempPath
-	IPDBPath string
-	//disable automatic fetch of GeoLite2-Country.mmdb file
-	//by default, when ipfilter.IPDBPath is not found,
-	//ipfilter.IPDBFetchURL will be retrieved and stored at
-	//ipfilter.IPDBPath, then loaded into memory (~19MB)
-	IPDBNoFetch bool
-	//URL of GeoLite2-Country.mmdb[.gz] file,
-	//if not provided defaults to ipfilter.DBPublicURL
-	IPDBFetchURL string
 	//block by default (defaults to allow)
 	BlockByDefault bool
-
+	// TrustProxy enable check request IP from proxy
+	TrustProxy bool
+	// Logger enables logging, printing using the provided interface
 	Logger interface {
 		Printf(format string, v ...interface{})
 	}
+	// These fields currently have no effect
+	IPDB         []byte
+	IPDBPath     string
+	IPDBNoFetch  bool
+	IPDBFetchURL string
 }
 
 type IPFilter struct {
@@ -65,7 +50,6 @@ type IPFilter struct {
 	//rw since writes are rare
 	mut            sync.RWMutex
 	defaultAllowed bool
-	db             *maxminddb.Reader
 	ips            map[string]bool
 	codes          map[string]bool
 	subnets        []*subnet
@@ -77,17 +61,11 @@ type subnet struct {
 	allowed bool
 }
 
-//who uses the new builtin anyway?
-func new(opts Options) *IPFilter {
-	if opts.IPDBFetchURL == "" {
-		opts.IPDBFetchURL = DBPublicURL
-	}
-	if opts.IPDBPath == "" {
-		opts.IPDBPath = DBTempPath
-	}
+//New constructs IPFilter instance without downloading DB.
+func New(opts Options) *IPFilter {
 	if opts.Logger == nil {
-		flags := log.LstdFlags
-		opts.Logger = log.New(os.Stdout, "", flags)
+		//disable logging by default
+		opts.Logger = log.New(ioutil.Discard, "", 0)
 	}
 	f := &IPFilter{
 		opts:           opts,
@@ -110,101 +88,10 @@ func new(opts Options) *IPFilter {
 	return f
 }
 
-//NewLazy performs database intilisation in a goroutine.
-//During this intilisation, any DB (country code) lookups
-//will be skipped. Errors will be logged instead of returned.
-func NewLazy(opts Options) *IPFilter {
-	f := new(opts)
-	go func() {
-		if err := f.initDB(); err != nil {
-			f.opts.Logger.Printf("[ipfilter] failed to intilise db: %s", err)
-		}
-	}()
-	return f
-}
-
-//New blocks during database intilisation and checks
-//validity IP strings. returns an error on failure.
-func New(opts Options) (*IPFilter, error) {
-	f := new(opts)
-	if err := f.initDB(); err != nil {
-		return nil, err
+func (f *IPFilter) printf(format string, args ...interface{}) {
+	if l := f.opts.Logger; l != nil {
+		l.Printf("[ipfilter] "+format, args...)
 	}
-	return f, nil
-}
-
-func (f *IPFilter) initDB() error {
-	//in-memory
-	if len(f.opts.IPDB) > 0 {
-		return f.bytesDB(f.opts.IPDB)
-	}
-	//use local copy
-	if fileinfo, err := os.Stat(f.opts.IPDBPath); err == nil {
-		if fileinfo.Size() > 0 {
-			file, err := os.Open(f.opts.IPDBPath)
-			if err != nil {
-				return err
-			}
-			defer file.Close()
-			if err = f.readerDB(f.opts.IPDBFetchURL, file); err != nil {
-				f.opts.Logger.Printf("[ipfilter] error reading db file %v", err)
-				if errDel := os.Remove(f.opts.IPDBPath); errDel != nil {
-					f.opts.Logger.Printf("[ipfilter] error removing bad file %v", f.opts.IPDBPath)
-				}
-			}
-			return err
-		} else {
-			f.opts.Logger.Printf("[ipfilter] IP DB is 0 byte size")
-		}
-	}
-	//ensure fetch is allowed
-	if f.opts.IPDBNoFetch {
-		return errors.New("IP DB not found and fetch is disabled")
-	}
-	//fetch and cache missing file
-	file, err := os.Create(f.opts.IPDBPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	f.opts.Logger.Printf("[ipfilter] downloading %s...", f.opts.IPDBFetchURL)
-	resp, err := http.Get(f.opts.IPDBFetchURL)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	//store on disk as db loads
-	r := io.TeeReader(resp.Body, file)
-	err = f.readerDB(DBPublicURL, r)
-	f.opts.Logger.Printf("[ipfilter] cached: %s", f.opts.IPDBPath)
-	return err
-}
-
-func (f *IPFilter) readerDB(filename string, r io.Reader) error {
-	if strings.HasSuffix(filename, ".gz") {
-		g, err := gzip.NewReader(r)
-		if err != nil {
-			return err
-		}
-		defer g.Close()
-		r = g
-	}
-	buff := bytes.Buffer{}
-	if _, err := io.Copy(&buff, r); err != nil {
-		return err
-	}
-	return f.bytesDB(buff.Bytes())
-}
-
-func (f *IPFilter) bytesDB(b []byte) error {
-	db, err := maxminddb.FromBytes(b)
-	if err != nil {
-		return err
-	}
-	f.mut.Lock()
-	f.db = db
-	f.mut.Unlock()
-	return nil
 }
 
 func (f *IPFilter) AllowIP(ip string) bool {
@@ -218,7 +105,7 @@ func (f *IPFilter) BlockIP(ip string) bool {
 func (f *IPFilter) ToggleIP(str string, allowed bool) bool {
 	//check if has subnet
 	if ip, net, err := net.ParseCIDR(str); err == nil {
-		// containing only one ip?
+		// containing only one ip? (no bits masked)
 		if n, total := net.Mask.Size(); n == total {
 			f.mut.Lock()
 			f.ips[ip.String()] = allowed
@@ -245,7 +132,7 @@ func (f *IPFilter) ToggleIP(str string, allowed bool) bool {
 		f.mut.Unlock()
 		return true
 	}
-	//check if plain ip
+	//check if plain ip (/32)
 	if ip := net.ParseIP(str); ip != nil {
 		f.mut.Lock()
 		f.ips[ip.String()] = allowed
@@ -283,7 +170,7 @@ func (f *IPFilter) Allowed(ipstr string) bool {
 	return f.NetAllowed(net.ParseIP(ipstr))
 }
 
-//Allowed returns if a given net.IP can pass through the filter
+//NetAllowed returns if a given net.IP can pass through the filter
 func (f *IPFilter) NetAllowed(ip net.IP) bool {
 	//invalid ip
 	if ip == nil {
@@ -312,9 +199,7 @@ func (f *IPFilter) NetAllowed(ip net.IP) bool {
 		return false
 	}
 	//check country codes
-	f.mut.RUnlock()
-	code := f.NetIPToCountry(ip)
-	f.mut.RLock()
+	code := NetIPToCountry(ip)
 	if code != "" {
 		if allowed, ok := f.codes[code]; ok {
 			return allowed
@@ -329,7 +214,7 @@ func (f *IPFilter) Blocked(ip string) bool {
 	return !f.Allowed(ip)
 }
 
-//Blocked returns if a given net.IP can NOT pass through the filter
+//NetBlocked returns if a given net.IP can NOT pass through the filter
 func (f *IPFilter) NetBlocked(ip net.IP) bool {
 	return !f.NetAllowed(ip)
 }
@@ -340,58 +225,24 @@ func (f *IPFilter) Wrap(next http.Handler) http.Handler {
 	return &ipFilterMiddleware{IPFilter: f, next: next}
 }
 
-//IP string to ISO country code.
-//Returns an empty string when cannot determine country.
-func (f *IPFilter) IPToCountry(ipstr string) string {
-	if ip := net.ParseIP(ipstr); ip != nil {
-		return f.NetIPToCountry(ip)
-	}
-	return ""
-}
-
-//net.IP to ISO country code.
-//Returns an empty string when cannot determine country.
-func (f *IPFilter) NetIPToCountry(ip net.IP) string {
-	f.mut.RLock()
-	db := f.db
-	f.mut.RUnlock()
-	return NetIPToCountry(db, ip)
-}
-
 //Wrap is equivalent to NewLazy(opts) then Wrap(next)
 func Wrap(next http.Handler, opts Options) http.Handler {
-	return NewLazy(opts).Wrap(next)
+	return New(opts).Wrap(next)
 }
 
 //IPToCountry is a simple IP-country code lookup.
 //Returns an empty string when cannot determine country.
-func IPToCountry(db *maxminddb.Reader, ipstr string) string {
-	if ip := net.ParseIP(ipstr); ip != nil {
-		return NetIPToCountry(db, ip)
-	}
-	return ""
+func IPToCountry(ipstr string) string {
+	return NetIPToCountry(net.ParseIP(ipstr))
 }
 
 //NetIPToCountry is a simple IP-country code lookup.
 //Returns an empty string when cannot determine country.
-func NetIPToCountry(db *maxminddb.Reader, ip net.IP) string {
-	r := struct {
-		//TODO(jpillora): lookup more fields and expose more options
-		// IsAnonymous       bool `maxminddb:"is_anonymous"`
-		// IsAnonymousVPN    bool `maxminddb:"is_anonymous_vpn"`
-		// IsHostingProvider bool `maxminddb:"is_hosting_provider"`
-		// IsPublicProxy     bool `maxminddb:"is_public_proxy"`
-		// IsTorExitNode     bool `maxminddb:"is_tor_exit_node"`
-		Country struct {
-			Country string `maxminddb:"iso_code"`
-			// Names   map[string]string `maxminddb:"names"`
-		} `maxminddb:"country"`
-	}{}
-	if db != nil {
-		db.Lookup(ip, &r)
+func NetIPToCountry(ip net.IP) string {
+	if ip != nil {
+		return string(iploc.Country(ip))
 	}
-	//DEBUG log.Printf("%s -> '%s'", ip, r.Country.Country)
-	return r.Country.Country
+	return ""
 }
 
 type ipFilterMiddleware struct {
@@ -400,14 +251,41 @@ type ipFilterMiddleware struct {
 }
 
 func (m *ipFilterMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	//use remote addr as it cant be spoofed
-	//TODO also check X-Fowarded-For and friends
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	//show simple forbidden text
-	if !m.IPFilter.Allowed(ip) {
+	var remoteIP string
+	if m.opts.TrustProxy {
+		remoteIP = realip.FromRequest(r)
+	} else {
+		remoteIP, _, _ = net.SplitHostPort(r.RemoteAddr)
+	}
+	allowed := m.IPFilter.Allowed(remoteIP)
+	//special case localhost ipv4
+	if !allowed && remoteIP == "::1" && m.IPFilter.Allowed("127.0.0.1") {
+		allowed = true
+	}
+	if !allowed {
+		//show simple forbidden text
+		m.printf("blocked %s", remoteIP)
 		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 		return
 	}
 	//success!
 	m.next.ServeHTTP(w, r)
+}
+
+//NewNoDB is the same as New
+func NewNoDB(opts Options) *IPFilter {
+	return New(opts)
+}
+
+//NewLazy is the same as New
+func NewLazy(opts Options) *IPFilter {
+	return New(opts)
+}
+
+func (f *IPFilter) IPToCountry(ipstr string) string {
+	return IPToCountry(ipstr)
+}
+
+func (f *IPFilter) NetIPToCountry(ip net.IP) string {
+	return NetIPToCountry(ip)
 }
